@@ -1,5 +1,6 @@
-import asyncio, logging, httpx, sqlite3, urllib.parse
+import asyncio, logging, httpx, sqlite3, urllib.parse, os, base64
 from datetime import datetime, timedelta
+from typing import Optional
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import Message, PreCheckoutQuery, LabeledPrice
@@ -9,8 +10,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
-BOT_TOKEN = "8853136666:AAGEKuByHdFAV-MqL9mLUqEVQKBKr_iu2ds"
-VSEGPT_API_KEY = "sk-or-vv-7fef54a6b1bab44bc2f477d7c1f754f09608538240fa0512c502e86496f02d8d"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8853136666:AAGEKuByHdFAV-MqL9mLUqEVQKBKr_iu2ds")
+VSEGPT_API_KEY = os.getenv("VSEGPT_API_KEY", "sk-or-vv-ea83acaf1f75c7ee5cb960931706a190a0081b92f24da62db0c29651f72a96a0")
 MODEL_NAME = "deepseek/deepseek-chat"
 FREE_LIMIT = 5
 SUB_PRICE = 111
@@ -114,7 +115,6 @@ def rmenu(k):
     b.add(InlineKeyboardButton(text="🔄 Другой", callback_data=f"cat_{k}"))
     b.add(InlineKeyboardButton(text="✏️ Уточнить", callback_data=f"custom_{k}"))
     b.add(InlineKeyboardButton(text="⭐ В избранное", callback_data=f"fav_{k}"))
-    b.add(InlineKeyboardButton(text="📸 Фото", callback_data=f"photo_{k}"))
     b.add(InlineKeyboardButton(text="🏠 Меню", callback_data="menu"))
     b.adjust(2)
     return b.as_markup()
@@ -133,14 +133,44 @@ async def ai(sp, up):
             json={"model":MODEL_NAME,"messages":[{"role":"system","content":sp},{"role":"user","content":up}],"temperature":1.0,"max_tokens":1000})
         return r.json()["choices"][0]["message"]["content"]
 
-async def get_photo_url(recipe_text):
-    """Генерирует фото через pollinations.ai"""
-    first = recipe_text.split("\n")[0] if recipe_text else "food"
-    for c in "🍽️🍸🍹🫖🍕🥩🍜🥬🧊🔥🥗🍰👨‍🍳📝💡⭐►▶•#*0123456789":
-        first = first.replace(c, "")
-    name = first.strip() or "food dish"
-    prompt = urllib.parse.quote(f"{name}, professional food photography, high quality")
-    return f"https://image.pollinations.ai/prompt/{prompt}?width=512&height=512&nologo=true"
+async def generate_photo_file(recipe_text: str) -> Optional[str]:
+    """AI создаёт промт → VseGPT генерит фото → сохраняет в файл"""
+    
+    # Шаг 1: AI создаёт промт на основе рецепта
+    prompt_req = f"Создай короткий промт на английском (до 100 слов) для генерации фото этого блюда. Опиши внешний вид, цвета, подачу. Только промт, без лишних слов.\n\n{recipe_text[:500]}"
+    
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.post(
+                "https://api.vsegpt.ru/v1/chat/completions",
+                headers={"Authorization": f"Bearer {VSEGPT_API_KEY}", "Content-Type": "application/json"},
+                json={"model": MODEL_NAME, "messages": [{"role": "system", "content": "Ты — фуд-фотограф. Создаёшь промты."}, {"role": "user", "content": prompt_req}], "temperature": 0.7, "max_tokens": 200}
+            )
+            photo_prompt = r.json()["choices"][0]["message"]["content"].strip()
+    except:
+        return None
+    
+    # Шаг 2: VseGPT генерит фото
+    try:
+        async with httpx.AsyncClient(timeout=120) as c:
+            r = await c.post(
+                "https://api.vsegpt.ru/v1/images/generations",
+                headers={"Authorization": f"Bearer {VSEGPT_API_KEY}", "Content-Type": "application/json"},
+                json={"model": "img-stable/stable-diffusion-xl-lightning", "prompt": photo_prompt, "response_format": "b64_json"}
+            )
+            if r.status_code == 200:
+                data = r.json()
+                if "data" in data and len(data["data"]) > 0:
+                    img = data["data"][0]
+                    if "b64_json" in img:
+                        img_bytes = base64.b64decode(img["b64_json"])
+                        filepath = f"./chef_photo_{abs(hash(recipe_text)) % 100000}.png"
+                        with open(filepath, "wb") as f:
+                            f.write(img_bytes)
+                        return filepath
+    except:
+        pass
+    return None
 
 @dp.message(Command("start"))
 async def start(msg: Message):
@@ -158,7 +188,7 @@ async def chk(cb: types.CallbackQuery):
 
 @dp.callback_query(F.data=="about")
 async def about(cb: types.CallbackQuery):
-    await cb.message.edit_text(f"👨‍🍳 AI-Шеф\n\n{FREE_LIMIT} рецептов/нед\nPro: {SUB_PRICE} Stars/мес", reply_markup=menu())
+    await cb.message.edit_text(f"👨‍🍳 AI-Шеф\n\n{FREE_LIMIT} рецептов/нед\nPro: {SUB_PRICE} Stars/мес\n\nФото: AI + Stable Diffusion", reply_markup=menu())
 
 @dp.callback_query(F.data=="sub_info")
 async def sub_info(cb: types.CallbackQuery):
@@ -178,7 +208,7 @@ async def guide(cb: types.CallbackQuery):
     b.add(InlineKeyboardButton(text=f"💎 Pro — {SUB_PRICE}⭐", callback_data="buy_sub"))
     b.add(InlineKeyboardButton(text="🔙 Назад", callback_data="sub_info"))
     b.adjust(1)
-    await cb.message.edit_text("📖 <b>Как купить Stars</b>\n\n<b>@PremiumBot</b>\n1. Открой @PremiumBot\n2. /stars → Купить\n3. Оплати картой/СберПэй\n💰 ~179₽/100⭐\n\n<b>Настройки TG</b>\nНастройки → Мои звезды", parse_mode="HTML", reply_markup=b.as_markup())
+    await cb.message.edit_text("📖 <b>Как купить Stars</b>\n\n<b>@PremiumBot</b>\n1. Открой @PremiumBot\n2. /stars → Купить\n3. Оплати картой/СберПэй\n💰 ~179₽/100⭐", parse_mode="HTML", reply_markup=b.as_markup())
 
 @dp.callback_query(F.data=="buy_sub")
 async def buy(cb: types.CallbackQuery):
@@ -215,26 +245,34 @@ async def cat_h(cb: types.CallbackQuery):
     k = cb.data.replace("cat_","")
     await cb.message.edit_text(f"👨‍🍳 Готовлю {CAT[k]}...")
     pr = {
-        "salad":("Ты — шеф. Придумай салат.","Салат"),
-        "cold":("Ты — шеф. Придумай закуску.","Закуска"),
-        "soup":("Ты — шеф. Придумай суп.","Суп"),
-        "hot":("Ты — шеф. Придумай горячее.","Горячее"),
-        "pizza":("Ты — пиццайоло. Придумай пиццу.","Пицца"),
-        "grill":("Ты — шеф. Придумай блюдо на мангал.","Мангал"),
-        "dessert":("Ты — кондитер. Придумай десерт.","Десерт"),
-        "alco":("Ты — бармен. Придумай коктейль.","Коктейль"),
-        "nonalco":("Ты — бармен. Придумай безалко.","Коктейль"),
-        "tea":("Ты — чайный мастер. Придумай чай.","Чай"),
-        "lent":("Ты — шеф. Придумай постное.","Постное"),
+        "salad":("Шеф. Придумай салат.","Салат"), "cold":("Шеф. Придумай закуску.","Закуска"),
+        "soup":("Шеф. Придумай суп.","Суп"), "hot":("Шеф. Придумай горячее.","Горячее"),
+        "pizza":("Пиццайоло. Придумай пиццу.","Пицца"), "grill":("Шеф. Блюдо на мангал.","Мангал"),
+        "dessert":("Кондитер. Придумай десерт.","Десерт"), "alco":("Бармен. Придумай коктейль.","Коктейль"),
+        "nonalco":("Бармен. Безалко-коктейль.","Коктейль"), "tea":("Чайный мастер. Придумай чай.","Чай"),
+        "lent":("Шеф. Постное блюдо.","Постное"),
     }
     sp, up = pr[k]
-    sp += "\nФормат: 🍽️ Название\n📝 Ингредиенты\n👨‍🍳 Приготовление\n💡 Совет\nНа русском."
+    sp = f"Ты — {sp}\nФормат: 🍽️ Название\n📝 Ингредиенты\n👨‍🍳 Приготовление\n💡 Совет\nНа русском."
     try:
         rec = await ai(sp, up)
         inc_usage(uid)
     except:
         rec = "⚠️ Ошибка."
+    
+    # Отправляем рецепт
     await cb.message.edit_text(f"{info(uid)}\n\n{rec}", reply_markup=rmenu(k))
+    
+    # Генерируем фото в фоне
+    await cb.message.answer("📸 Генерирую фото...")
+    filepath = await generate_photo_file(rec)
+    if filepath:
+        try:
+            await cb.message.answer_photo(photo=types.FSInputFile(filepath), caption="📸 Фото блюда!")
+        except:
+            await cb.message.answer("⚠️ Не удалось загрузить фото.")
+    else:
+        await cb.message.answer("⚠️ Не удалось сгенерировать фото.")
 
 @dp.callback_query(F.data.startswith("custom_"))
 async def cust_start(cb: types.CallbackQuery, state: FSMContext):
@@ -258,6 +296,15 @@ async def cust_gen(msg: Message, state: FSMContext):
     except:
         rec = "⚠️ Ошибка."
     await msg.answer(f"{info(msg.from_user.id)}\n\n{rec}", reply_markup=rmenu(k))
+    await msg.answer("📸 Генерирую фото...")
+    filepath = await generate_photo_file(rec)
+    if filepath:
+        try:
+            await msg.answer_photo(photo=types.FSInputFile(filepath), caption="📸 Фото блюда!")
+        except:
+            await msg.answer("⚠️ Не удалось загрузить фото.")
+    else:
+        await msg.answer("⚠️ Не удалось сгенерировать фото.")
 
 @dp.callback_query(F.data=="fridge_start")
 async def fr_start(cb: types.CallbackQuery, state: FSMContext):
@@ -270,18 +317,26 @@ async def fr_start(cb: types.CallbackQuery, state: FSMContext):
 @dp.message(S.fridge)
 async def fr_gen(msg: Message, state: FSMContext):
     await state.clear()
-    sp = f"Ты — шеф. Придумай блюдо из: {msg.text}.\nФормат: 🍽️ Название\n📝 Ингредиенты\n👨‍🍳 Приготовление\n💡 Совет\nНа русском."
+    sp = f"Ты — шеф. Блюдо из: {msg.text}.\nФормат: 🍽️ Название\n📝 Ингредиенты\n👨‍🍳 Приготовление\n💡 Совет\nНа русском."
     try:
         rec = await ai(sp, f"Блюдо из: {msg.text}")
         inc_usage(msg.from_user.id)
     except:
         rec = "⚠️ Ошибка."
     b = InlineKeyboardBuilder()
-    b.add(InlineKeyboardButton(text="📸 Фото", callback_data="photo_fridge"))
     b.add(InlineKeyboardButton(text="🧊 Ещё", callback_data="fridge_start"))
     b.add(InlineKeyboardButton(text="🏠 Меню", callback_data="menu"))
     b.adjust(1)
     await msg.answer(f"{info(msg.from_user.id)}\n\n{rec}", reply_markup=b.as_markup())
+    await msg.answer("📸 Генерирую фото...")
+    filepath = await generate_photo_file(rec)
+    if filepath:
+        try:
+            await msg.answer_photo(photo=types.FSInputFile(filepath), caption="📸 Фото блюда!")
+        except:
+            await msg.answer("⚠️ Не удалось загрузить фото.")
+    else:
+        await msg.answer("⚠️ Не удалось сгенерировать фото.")
 
 @dp.callback_query(F.data.startswith("fav_"))
 async def fav(cb: types.CallbackQuery):
@@ -306,18 +361,6 @@ async def sfav(cb: types.CallbackQuery):
     for r in rows:
         text += f"• {r[0].split(chr(10))[0] if r[0] else '—'}\n"
     await cb.message.edit_text(text, reply_markup=menu())
-
-@dp.callback_query(F.data.startswith("photo_"))
-async def photo_h(cb: types.CallbackQuery):
-    recipe_text = cb.message.text or ""
-    k = cb.data.replace("photo_","")
-    await cb.message.edit_text("📸 Ищу фото...")
-    try:
-        url = await get_photo_url(recipe_text)
-        await cb.message.answer_photo(photo=url, caption="📸 Готово!")
-    except Exception as e:
-        await cb.message.answer(f"⚠️ Не удалось загрузить фото.")
-    await cb.message.edit_text(recipe_text, reply_markup=rmenu(k))
 
 async def main():
     logging.basicConfig(level=logging.INFO)
